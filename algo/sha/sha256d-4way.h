@@ -4,7 +4,12 @@
 #include <stdint.h>
 #include "algo-gate-api.h"
 
-#if defined(SIMD512)
+#if defined(SHA256D_FORCE_SHA_NI)
+  #if !defined(__x86_64__) || !defined(__SHA__)
+    #error "SHA256D_FORCE_SHA_NI requires x86-64 with SHA extensions"
+  #endif
+  #define SHA256D_SHA 1
+#elif defined(SIMD512)
   #define SHA256D_16WAY 1
 #elif defined(__SHA__)
   #define SHA256D_SHA 1

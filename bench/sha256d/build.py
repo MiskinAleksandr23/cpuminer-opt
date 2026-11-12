@@ -1,4 +1,4 @@
-"""Build an unmodified cpuminer-opt Git revision in a fresh, isolated directory."""
+"""Build verified SHA256d miner configurations from an isolated local Git revision."""
 import hashlib
 import json
 import os
@@ -14,17 +14,22 @@ CFLAGS = "-O3 -march=native -std=gnu11 -Wall"
 APT_PACKAGES = ("git python3 build-essential autoconf automake libssl-dev "
                 "libcurl4-openssl-dev libjansson-dev libgmp-dev zlib1g-dev")
 # Linux exposes these names only when the guest OS supports the vector context.
-CPU_FLAGS = {"avx512f", "avx512bw", "avx512dq", "avx512vl", "aes", "avx2"}
-CC_MACROS = {"__AVX512F__", "__AVX512BW__", "__AVX512DQ__", "__AVX512VL__",
+AVX512_CPU_FLAGS = {"avx512f", "avx512bw", "avx512dq", "avx512vl", "aes", "avx2"}
+AVX512_CC_MACROS = {"__AVX512F__", "__AVX512BW__", "__AVX512DQ__", "__AVX512VL__",
              "__AES__", "__AVX2__", "__x86_64__"}
 
+SHA_NI_CPU_FLAGS = {"sha_ni", "ssse3", "sse4_1"}
+SHA_NI_CC_MACROS = {"__SHA__", "__SSSE3__", "__SSE4_1__", "__x86_64__"}
+SHA_NI_DEFINE = "SHA256D_FORCE_SHA_NI"
 
-def check_build_host(cc):
+def check_build_host(cc, sha_ni=False):
     """Validate the actual compiler target before starting a full miner build."""
     if platform.system() != "Linux" or platform.machine().lower() not in ("x86_64", "amd64"):
         raise RuntimeError("The native benchmark requires x86-64 Linux.")
     needed = ("git", "tar", "sh", "aclocal", "autoheader", "automake", "autoconf",
               "g++", "make", cc)
+    if sha_ni:
+        needed += ("objdump",)
     missing = [program for program in needed if not shutil.which(program)]
     if missing:
         raise RuntimeError("Missing build commands: " + ", ".join(missing) +
@@ -35,19 +40,20 @@ def check_build_host(cc):
     if "__GNUC__" not in macros or "__clang__" in macros:
         raise RuntimeError("Use GCC, e.g. --cc gcc. The unmodified v26.1 SIMD headers "
                            "use an immediate operand that some Clang versions reject.")
-    absent = CC_MACROS - macros
+    absent = (SHA_NI_CC_MACROS if sha_ni else AVX512_CC_MACROS) - macros
     if absent:
         raise RuntimeError("Compiler -march=native lacks " + ", ".join(sorted(absent)) +
                            ". Check the VM CPU flags and GCC version.")
 
 
-def check_cpu_flags(cpu):
+def check_cpu_flags(cpu, sha_ni=False):
     """Check the Linux flags of the exact logical CPU used for the benchmark."""
     for block in Path("/proc/cpuinfo").read_text().strip().split("\n\n"):
         fields = {key.strip(): value.strip() for key, value in
                   (line.split(":", 1) for line in block.splitlines() if ":" in line)}
         if fields.get("processor") == str(cpu):
-            missing = CPU_FLAGS - set(fields.get("flags", "").split())
+            required = SHA_NI_CPU_FLAGS if sha_ni else AVX512_CPU_FLAGS
+            missing = required - set(fields.get("flags", "").split())
             if missing:
                 raise RuntimeError(f"CPU {cpu} lacks " + ", ".join(sorted(missing)))
             return fields.get("model name", "unknown")
@@ -68,9 +74,18 @@ def build_variants(repo: Path, dest: Path, cc: str, jobs: int) -> dict:
     All files go into a new destination. The checkout and its uncommitted changes
     are not consulted after exporting the local Git object.
     """
+    return _build(repo, dest, cc, jobs, sha_ni=False)
+
+
+def build_sha_ni(repo: Path, dest: Path, cc: str, jobs: int) -> Path:
+    """Build and check only the miner using the two-header x86 SHA-NI scanner."""
+    return _build(repo, dest, cc, jobs, sha_ni=True)["sha_ni"]
+
+
+def _build(repo, dest, cc, jobs, sha_ni):
     if jobs < 1:
         raise ValueError("jobs must be positive")
-    check_build_host(cc)
+    check_build_host(cc, sha_ni=sha_ni)
     repo, dest = Path(repo).resolve(), Path(dest).resolve()
     rev = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "--verify",
                                    "HEAD^{commit}"], text=True).strip()
@@ -79,12 +94,13 @@ def build_variants(repo: Path, dest: Path, cc: str, jobs: int) -> dict:
     src.mkdir()
     bins.mkdir()
     cc_path = shutil.which(cc)
-    env = dict(os.environ, CC=cc_path, CXX="g++", CFLAGS=CFLAGS,
+    cflags = CFLAGS + (f" -D{SHA_NI_DEFINE}=1" if sha_ni else "")
+    env = dict(os.environ, CC=cc_path, CXX="g++", CFLAGS=cflags,
                CXXFLAGS="-O3 -march=native -Wall", LC_ALL="C")
     log_file = dest / "build.log"
     meta = {"commit": rev, "compiler": subprocess.check_output([cc_path, "--version"],
-            text=True).splitlines()[0], "cflags": CFLAGS, "commands": [], "variants": {}}
-    switches = {
+            text=True).splitlines()[0], "cflags": cflags, "commands": [], "variants": {}}
+    switches = {"sha_ni": ()} if sha_ni else {
         "combined": (),
         "base": ("SHA256D_BENCH_BASE_ROUNDS", "SHA256D_BENCH_BASE_TERNARY"),
         "rounds": ("SHA256D_BENCH_BASE_TERNARY",),
@@ -110,7 +126,9 @@ def build_variants(repo: Path, dest: Path, cc: str, jobs: int) -> dict:
                 run(["tar", "-xf", archive, "-C", str(src)])
             source = src / "algo/sha/sha256-hash-4way.c"
             original = source.read_bytes()
-            for define in switches["base"]:
+            if sha_ni and SHA_NI_DEFINE not in (src/"algo/sha/sha256d.h").read_text():
+                raise RuntimeError(f"Revision {rev[:12]} lacks the {SHA_NI_DEFINE} build switch.")
+            for define in switches.get("base", ()):
                 if define.encode() not in original:
                     raise RuntimeError(f"Revision {rev[:12]} lacks the {define} build switch.")
             run(["sh", "autogen.sh"])
@@ -120,6 +138,9 @@ def build_variants(repo: Path, dest: Path, cc: str, jobs: int) -> dict:
                 "algo/sha/cpuminer-sha256d.o", "algo/sha/cpuminer-sha256d-4way.o",
                 "simd-utils/cpuminer-simd-constants.o",
             ]
+            if sha_ni:
+                # No AVX-512 compressor is used or needed by the forced SHA-NI scanner.
+                verify_objects.remove("algo/sha/cpuminer-sha256-hash-4way.o")
             sha_obj = src / verify_objects[0]
             for label, defines in switches.items():
                 print(f"Building and checking {label} ...", flush=True)
@@ -130,7 +151,15 @@ def build_variants(repo: Path, dest: Path, cc: str, jobs: int) -> dict:
                     sha_obj.unlink()
                     (src / "cpuminer").unlink()
                 run(["make", "-j" + str(jobs)])
-                run([cc_path, *CFLAGS.split(), "-fno-strict-aliasing", "-I.", "-Icompat/jansson",
+                if sha_ni:
+                    symbol = "sha256_x86_x2sha_final_rounds"
+                    disasm = ["objdump", "-d", "--disassemble=" + symbol, str(sha_obj)]
+                    meta["commands"].append(disasm)
+                    listing = subprocess.check_output(disasm, env=env, text=True)
+                    if "sha256rnds2" not in listing.lower():
+                        raise RuntimeError(f"No SHA256RNDS2 instruction found in {symbol}.")
+                    log.write(f"Verified SHA256RNDS2 in {symbol}.\n")
+                run([cc_path, *cflags.split(), "-fno-strict-aliasing", "-I.", "-Icompat/jansson",
                      "bench/sha256d/verify.c", *verify_objects, "-lcrypto", "-o", "verify-sha256d"])
                 run(["./verify-sha256d"])
                 binary = bins / label

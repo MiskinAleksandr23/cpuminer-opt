@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and compare the four SHA256d AVX-512 configurations on a Linux CPU."""
+"""Benchmark four AVX-512 SHA256d variants, or run the separate SHA-NI scanner."""
 import argparse
 import csv
 from datetime import datetime, timezone
@@ -15,7 +15,8 @@ import statistics
 import subprocess
 import sys
 
-from build import build_variants, check_cpu_flags
+from build import build_sha_ni, build_variants, check_cpu_flags
+from history import find_reference
 
 REPO = Path(__file__).resolve().parents[2]
 VARIANTS = ("base", "rounds", "ternary", "combined")
@@ -57,10 +58,10 @@ def cpu_ticks(cpu):
     return None
 
 
-def measure(binary, variant, duration, cpu, log, phase, round_no, position):
+def measure(binary, variant, duration, cpu, log, phase, round_no, position, group_size):
     argv = [str(binary), "-a", "sha256d", "-t", "1", "--benchmark",
             f"--time-limit={duration}", "--scantime=3", "--cpu-affinity=0", "--no-color"]
-    print(f"{phase} {round_no} | {position}/4 | {variant} | {duration}s", flush=True)
+    print(f"{phase} {round_no} | {position}/{group_size} | {variant} | {duration}s", flush=True)
     start = datetime.now(timezone.utc).isoformat()
     before = cpu_ticks(cpu)
     with log.open("x") as stream:
@@ -73,7 +74,8 @@ def measure(binary, variant, duration, cpu, log, phase, round_no, position):
     if len(matches) != 1:
         raise RuntimeError(f"Expected exactly one SHA256D_BENCH result; see {log}")
     hashes, sec = int(matches[0][0]), float(matches[0][1])
-    if not hashes or hashes % 16 or not max(1, duration-10) <= sec <= duration+30:
+    lanes = 2 if variant == "sha_ni" else 16
+    if not hashes or hashes % lanes or not max(1, duration-10) <= sec <= duration+30:
         raise RuntimeError(f"Invalid count/duration ({hashes}, {sec}); see {log}")
     steal = None
     if before and after and after[0] > before[0]:
@@ -106,43 +108,77 @@ def summarize(samples):
                 combined_lower_bound_above_1_percent=(interval[0] > 1 if interval else None))
 
 
+def summarize_sha_ni(samples, reference):
+    rates = [r["hashes_per_second"] for r in samples if r["phase"] == "measure"]
+    rate = math.exp(statistics.mean(map(math.log, rates)))
+    print(f"sha_ni    {rate/1e6:9.4f} MH/s")
+    report = {"mode": "sha_ni", "completed_rounds": len(rates),
+              "variants": {"sha_ni": {"geometric_mean_h_s": rate}}}
+    if reference:
+        changes = {k: 100*(rate/old-1) for k, old in reference["geometric_mean_h_s"].items()}
+        report["historical_comparison"] = {**reference, "sha_ni_delta_percent": changes}
+        print(f"Previous AVX-512 measurements (unpaired): {reference['directory']}")
+        for label, pct in changes.items():
+            print(f"  SHA-NI vs previous {label}: {pct:+.2f}%")
+    return report
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--sha-ni-only", action="store_true",
+                   help="build and measure the hardware SHA scanner alone")
+    p.add_argument("--compare-to", type=Path, metavar="OLD_AVX_RUN",
+                   help="read a previous AVX-512 results directory (SHA-NI mode only)")
     p.add_argument("--minutes", type=int, default=5, help="minutes per measured run (default 5)")
     p.add_argument("--rounds", type=int, default=4, help="runs per variant (default 4)")
-    p.add_argument("--smoke", action="store_true", help="one 10-second run per variant, no warmup")
+    p.add_argument("--smoke", action="store_true", help="one 10-second run per selected variant, no warmup")
     p.add_argument("--cpu", type=int, help="pinned logical CPU (default first allowed)")
     p.add_argument("--jobs", type=int, default=1, help="parallel build jobs (default 1)")
     p.add_argument("--cc", default="gcc", help="GNU C compiler")
     p.add_argument("--seed", type=int, help="seed for measurement order")
     p.add_argument("--out", type=Path, help="new results directory")
     args = p.parse_args()
+    if args.compare_to and not args.sha_ni_only:
+        p.error("--compare-to requires --sha-ni-only")
     if platform.system() != "Linux" or platform.machine().lower() not in ("x86_64", "amd64"):
-        p.error("This native benchmark requires x86-64 Linux with AVX-512.")
+        p.error("This native benchmark requires x86-64 Linux.")
     if not 1 <= args.minutes <= 120 or not 1 <= args.rounds <= 100 or args.jobs < 1:
         p.error("minutes 1..120, rounds 1..100, jobs >= 1")
     allowed = os.sched_getaffinity(0)
     cpu = min(allowed) if args.cpu is None else args.cpu
     if cpu not in allowed:
         p.error(f"CPU {cpu} is unavailable; allowed CPUs: {sorted(allowed)}")
-    model = check_cpu_flags(cpu)
+    model = check_cpu_flags(cpu, sha_ni=args.sha_ni_only)
     now = datetime.now(timezone.utc)
     out = (args.out or REPO/"bench-results"/now.strftime("%Y%m%d-%H%M%S-%f")).resolve()
-    out.mkdir(parents=True, exist_ok=False)
     seed = args.seed if args.seed is not None else secrets.randbits(32)
     rng = random.Random(seed)
     duration, rounds = (10, 1) if args.smoke else (60*args.minutes, args.rounds)
-    plan = orders(rounds, rng)
-    warmup = [] if args.smoke else rng.sample(VARIANTS, len(VARIANTS))
+    selected = ("sha_ni",) if args.sha_ni_only else VARIANTS
+    plan = [["sha_ni"] for _ in range(rounds)] if args.sha_ni_only else orders(rounds, rng)
+    warmup = [] if args.smoke else rng.sample(selected, len(selected))
+    reference = None
+    if args.sha_ni_only:
+        try:
+            reference = find_reference(REPO/"bench-results", args.compare_to, model, cpu, duration)
+        except ValueError as exc:
+            p.error(str(exc))
+    out.mkdir(parents=True, exist_ok=False)
     meta = dict(status="building", cpu=cpu, cpu_model=model, platform=platform.platform(),
                 allowed_cpus=sorted(allowed), seed=seed, order=plan, warmup=warmup,
                 warmup_seconds=30, measured_seconds=duration, argv=sys.argv,
                 started_utc=now.isoformat())
+    meta["mode"] = "sha_ni" if args.sha_ni_only else "avx512"
+    if args.sha_ni_only:
+        meta["reference_directory"] = reference["directory"] if reference else None
     save_json(out/"run.json", meta)
     print(f"Results: {out}\nCPU {cpu}: {model}\n"
-          f"Planned miner time: {(4*duration*rounds + 30*len(warmup))/60:g} min + build", flush=True)
+          f"Planned miner time: {(len(selected)*duration*rounds + 30*len(warmup))/60:g} min + build", flush=True)
     try:
-        binaries = build_variants(REPO, out/"build", args.cc, args.jobs)
+        if args.sha_ni_only:
+            binaries = {"sha_ni": build_sha_ni(REPO, out/"build", args.cc, args.jobs)}
+        else:
+            binaries = build_variants(REPO, out/"build", args.cc, args.jobs)
         os.sched_setaffinity(0, {cpu})
         meta["status"] = "running"
         save_json(out/"run.json", meta)
@@ -154,20 +190,23 @@ def main():
             for phase, r, labels, seconds in schedule:
                 for pos, label in enumerate(labels, 1):
                     log = out/f"{phase}-{r:02d}-{pos}-{label}.log"
-                    sample = measure(binaries[label], label, seconds, cpu, log, phase, r, pos)
+                    sample = measure(binaries[label], label, seconds, cpu, log, phase, r, pos, len(labels))
                     if writer is None:
                         writer = csv.DictWriter(stream, fieldnames=sample)
                         writer.writeheader()
                     writer.writerow(sample)
                     stream.flush()
                     samples.append(sample)
-        report = summarize(samples)
+        if args.sha_ni_only:
+            report = summarize_sha_ni(samples, reference)
+        else:
+            report = summarize(samples)
+            for label, row in report["variants"].items():
+                ci = row["ci95_percent"]
+                suffix = f"  95% CI [{ci[0]:+.2f}, {ci[1]:+.2f}]%" if ci else ""
+                print(f"{label:9s} {row['geometric_mean_h_s']/1e6:9.4f} MH/s"
+                      f"  {row['paired_gain_percent']:+.2f}% vs base{suffix}")
         save_json(out/"summary.json", report)
-        for label, row in report["variants"].items():
-            ci = row["ci95_percent"]
-            suffix = f"  95% CI [{ci[0]:+.2f}, {ci[1]:+.2f}]%" if ci else ""
-            print(f"{label:9s} {row['geometric_mean_h_s']/1e6:9.4f} MH/s"
-                  f"  {row['paired_gain_percent']:+.2f}% vs base{suffix}")
         meta["status"] = "complete"
     except (Exception, KeyboardInterrupt) as error:
         meta.update(status="interrupted", error=repr(error))

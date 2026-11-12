@@ -7,8 +7,16 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifndef SHA256D_16WAY
-#error "Expected the 16-lane Bitcoin SHA256d scanner (AVX-512F/BW/DQ/VL)"
+#if defined(SHA256D_FORCE_SHA_NI) && defined(SHA256D_SHA)
+#define EXPECTED_SCANNER scanhash_sha256d_sha
+#define SCANNER_NAME "SHA-NI"
+enum { SCAN_WIDTH = 2 };
+#elif !defined(SHA256D_FORCE_SHA_NI) && defined(SHA256D_16WAY)
+#define EXPECTED_SCANNER scanhash_sha256d_16way
+#define SCANNER_NAME "AVX-512"
+enum { SCAN_WIDTH = 16 };
+#else
+#error "Expected the selected SHA256d scanner to match the benchmark build"
 #endif
 
 enum { HEADERS = 32 };
@@ -74,8 +82,8 @@ static void check_target(const algo_gate_t *gate, struct work *work, const uint3
     memset(submitted, 0, sizeof submitted);
     memcpy(work->target, target, 32);
     work->data[19] = first_nonce;
-    /* The 16-lane scanner interprets max_nonce - 16 as its exclusive end. */
-    gate->scanhash(work, first_nonce + HEADERS + 16, &hashes_done, &thread);
+    /* Each scanner subtracts its batch width from max_nonce before comparing. */
+    gate->scanhash(work, first_nonce + HEADERS + SCAN_WIDTH, &hashes_done, &thread);
     if (hashes_done != HEADERS || work->data[19] != first_nonce + HEADERS) {
         fprintf(stderr, "Unexpected SHA256d scan count: %" PRIu64 "\n", hashes_done);
         exit(EXIT_FAILURE);
@@ -92,8 +100,8 @@ int main(void)
 {
     algo_gate_t gate = {0};
     struct work work = {0};
-    if (!register_sha256d_algo(&gate) || gate.scanhash != scanhash_sha256d_16way) {
-        fputs("SHA256d AVX-512 scanner was not selected\n", stderr);
+    if (!register_sha256d_algo(&gate) || gate.scanhash != EXPECTED_SCANNER) {
+        fputs("SHA256d " SCANNER_NAME " scanner was not selected\n", stderr);
         return EXIT_FAILURE;
     }
     for (int lane = 0; lane < 16; ++lane) {
@@ -118,6 +126,6 @@ int main(void)
         prepare_reference(&work);
         check_target(&gate, &work, expected[(lane + 7) % HEADERS]);
     }
-    puts("SHA256d AVX-512 verification OK (64 scans, 2048 header checks)");
+    puts("SHA256d " SCANNER_NAME " verification OK (64 scans, 2048 header checks)");
     return EXIT_SUCCESS;
 }
