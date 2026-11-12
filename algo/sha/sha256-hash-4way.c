@@ -977,9 +977,9 @@ void sha256_8x32_full( void *dst, const void *data, size_t len )
 
 // SHA-256 16 way
 
-#define CHx16(X, Y, Z)    _mm512_ternarylogic_epi32( X, Y, Z, 0xca )
+#define CHx16(X, Y, Z)    _mm512_ternarylogic_epi32( Z, Y, X, 0xd8 )
 
-#define MAJx16(X, Y, Z)   _mm512_ternarylogic_epi32( X, Y, Z, 0xe8 )
+#define MAJx16(X, Y, Z)   _mm512_ternarylogic_epi32( Z, Y, X, 0xe8 )
 
 #define BSG2_0x16(x)      mm512_xor3( _mm512_ror_epi32( x,  2 ), \
                                       _mm512_ror_epi32( x, 13 ), \
