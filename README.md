@@ -210,3 +210,4 @@ cpuminer-opt has no fees of any kind but donations are accepted.
 
 Happy mining!
 
+[Build and compare the SHA256d AVX-512 experiments on Linux](bench/sha256d/README.md)

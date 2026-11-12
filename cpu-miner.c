@@ -2193,6 +2193,22 @@ static void *miner_thread( void *userdata )
    // nominal startng values
    int64_t max64 = 20;
    thr_hashrates[thr_id] = 20;
+#ifdef __linux__
+   const bool meter_sha256d = opt_benchmark && opt_time_limit > 0
+                           && opt_algo == ALGO_SHA256D && opt_n_threads == 1;
+   uint64_t bench_hashes = 0;
+   struct timespec bench_start;
+   if ( meter_sha256d )
+   {
+      // Leave room for the final 16-lane batch, as std_get_new_work does.
+      end_nonce = UINT32_MAX - 0x20U;
+      if ( clock_gettime( CLOCK_MONOTONIC, &bench_start ) )
+      {
+         perror( "benchmark clock_gettime" );
+         proper_exit( EXIT_FAILURE );
+      }
+   }
+#endif
    while (1)
    {
        uint64_t hashes_done;
@@ -2272,6 +2288,22 @@ static void *miner_thread( void *userdata )
                 char rate[32];
                 format_hashrate( global_hashrate, rate );
                 applog( LOG_NOTICE, "Benchmark: %s", rate );
+#ifdef __linux__
+                if ( meter_sha256d )
+                {
+                   struct timespec end;
+                   if ( clock_gettime( CLOCK_MONOTONIC, &end ) )
+                   {
+                      perror( "benchmark clock_gettime" );
+                      proper_exit( EXIT_FAILURE );
+                   }
+                   const double seconds = (double)( end.tv_sec - bench_start.tv_sec )
+                        + 1e-9 * ( end.tv_nsec - bench_start.tv_nsec );
+                   printf( "SHA256D_BENCH hashes=%" PRIu64 " seconds=%.9f\n",
+                           bench_hashes, seconds );
+                   fflush( stdout );
+                }
+#endif
              }
              else
                 applog( LOG_NOTICE, "Mining timeout of %ds reached, exiting...",
@@ -2306,6 +2338,10 @@ static void *miner_thread( void *userdata )
 
        // record scanhash elapsed time
        gettimeofday( &tv_end, NULL );
+#ifdef __linux__
+       if ( meter_sha256d )
+          bench_hashes += hashes_done;
+#endif
        timeval_subtract( &diff, &tv_end, &tv_start );
        if ( diff.tv_usec || diff.tv_sec )
        {

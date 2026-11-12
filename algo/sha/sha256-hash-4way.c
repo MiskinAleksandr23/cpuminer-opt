@@ -977,9 +977,15 @@ void sha256_8x32_full( void *dst, const void *data, size_t len )
 
 // SHA-256 16 way
 
+// The benchmark can rebuild this translation unit with either change disabled.
+#ifdef SHA256D_BENCH_BASE_TERNARY
+#define CHx16(X, Y, Z)    _mm512_ternarylogic_epi32( X, Y, Z, 0xca )
+#define MAJx16(X, Y, Z)   _mm512_ternarylogic_epi32( X, Y, Z, 0xe8 )
+#else
 #define CHx16(X, Y, Z)    _mm512_ternarylogic_epi32( Z, Y, X, 0xd8 )
 
 #define MAJx16(X, Y, Z)   _mm512_ternarylogic_epi32( Z, Y, X, 0xe8 )
+#endif
 
 #define BSG2_0x16(x)      mm512_xor3( _mm512_ror_epi32( x,  2 ), \
                                       _mm512_ror_epi32( x, 13 ), \
@@ -1299,7 +1305,11 @@ void sha256_16x32_final_rounds( __m512i *state_out, const __m512i *data,
 void sha256d_16x32_final_rounds( __m512i *state_out, const __m512i *data,
           const __m512i *state_in, const __m512i *state_mid, const __m512i *X )
 {
+#ifdef SHA256D_BENCH_BASE_ROUNDS
+   sha256_16x32_header_rounds( state_out, data, state_in, state_mid, X, 0 );
+#else
    sha256_16x32_header_rounds( state_out, data, state_in, state_mid, X, 1 );
+#endif
 }
 
 // returns 0 if hash aborted early and invalid,
