@@ -242,7 +242,7 @@ int scanhash_sha256d_16way( struct work *work, const uint32_t max_nonce,
 
    do
    {
-      sha256_16x32_final_rounds( block, buf, mstate1, mstate2, mexp_pre );
+      sha256d_16x32_final_rounds( block, buf, mstate1, mstate2, mexp_pre );
       if ( unlikely( sha256_16x32_transform_le_short(
                                   hash32, block, istate, ptarget ) ) )
       {

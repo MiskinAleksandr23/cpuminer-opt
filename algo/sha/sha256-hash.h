@@ -136,6 +136,8 @@ void sha256_16x32_prehash_3rounds( __m512i *state_mid, __m512i *X,
                                   const __m512i *W, const __m512i *state_in );
 void sha256_16x32_final_rounds( __m512i *state_out, const __m512i *data,
         const __m512i *state_in, const __m512i *state_mid, const __m512i *X );
+void sha256d_16x32_final_rounds( __m512i *state_out, const __m512i *data,
+        const __m512i *state_in, const __m512i *state_mid, const __m512i *X );
 
 int sha256_16x32_transform_le_short( __m512i *state_out, const __m512i *data,
                             const __m512i *state_in, const uint32_t *target );

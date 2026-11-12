@@ -1039,23 +1039,26 @@ void sha256_8x32_full( void *dst, const void *data, size_t len )
    H  = _mm512_add_epi32( H, T ); \
 }
 
+#define SHA256_16WAY_16ROUNDS_WITH( round, A, B, C, D, E, F, G, H, j ) \
+   round( A, B, C, D, E, F, G, H,  0, j ); \
+   round( H, A, B, C, D, E, F, G,  1, j ); \
+   round( G, H, A, B, C, D, E, F,  2, j ); \
+   round( F, G, H, A, B, C, D, E,  3, j ); \
+   round( E, F, G, H, A, B, C, D,  4, j ); \
+   round( D, E, F, G, H, A, B, C,  5, j ); \
+   round( C, D, E, F, G, H, A, B,  6, j ); \
+   round( B, C, D, E, F, G, H, A,  7, j ); \
+   round( A, B, C, D, E, F, G, H,  8, j ); \
+   round( H, A, B, C, D, E, F, G,  9, j ); \
+   round( G, H, A, B, C, D, E, F, 10, j ); \
+   round( F, G, H, A, B, C, D, E, 11, j ); \
+   round( E, F, G, H, A, B, C, D, 12, j ); \
+   round( D, E, F, G, H, A, B, C, 13, j ); \
+   round( C, D, E, F, G, H, A, B, 14, j ); \
+   round( B, C, D, E, F, G, H, A, 15, j );
+
 #define SHA256_16WAY_16ROUNDS( A, B, C, D, E, F, G, H, j ) \
-   SHA256_16WAY_ROUND( A, B, C, D, E, F, G, H,  0, j ); \
-   SHA256_16WAY_ROUND( H, A, B, C, D, E, F, G,  1, j ); \
-   SHA256_16WAY_ROUND( G, H, A, B, C, D, E, F,  2, j ); \
-   SHA256_16WAY_ROUND( F, G, H, A, B, C, D, E,  3, j ); \
-   SHA256_16WAY_ROUND( E, F, G, H, A, B, C, D,  4, j ); \
-   SHA256_16WAY_ROUND( D, E, F, G, H, A, B, C,  5, j ); \
-   SHA256_16WAY_ROUND( C, D, E, F, G, H, A, B,  6, j ); \
-   SHA256_16WAY_ROUND( B, C, D, E, F, G, H, A,  7, j ); \
-   SHA256_16WAY_ROUND( A, B, C, D, E, F, G, H,  8, j ); \
-   SHA256_16WAY_ROUND( H, A, B, C, D, E, F, G,  9, j ); \
-   SHA256_16WAY_ROUND( G, H, A, B, C, D, E, F, 10, j ); \
-   SHA256_16WAY_ROUND( F, G, H, A, B, C, D, E, 11, j ); \
-   SHA256_16WAY_ROUND( E, F, G, H, A, B, C, D, 12, j ); \
-   SHA256_16WAY_ROUND( D, E, F, G, H, A, B, C, 13, j ); \
-   SHA256_16WAY_ROUND( C, D, E, F, G, H, A, B, 14, j ); \
-   SHA256_16WAY_ROUND( B, C, D, E, F, G, H, A, 15, j );
+   SHA256_16WAY_16ROUNDS_WITH( SHA256_16WAY_ROUND, A, B, C, D, E, F, G, H, j )
 
 static inline void SHA256_16WAY_TRANSFORM( __m512i *out, __m512i *W,
                                            const  __m512i *in ) \
@@ -1156,8 +1159,36 @@ void sha256_16x32_prehash_3rounds( __m512i *state_mid, __m512i *X,
    _mm512_store_si512( state_mid + 7, H );
 }   
 
-void sha256_16x32_final_rounds( __m512i *state_out, const __m512i *data,
-          const __m512i *state_in, const __m512i *state_mid, const __m512i *X )
+// H and the message schedule can be ready before E. Keep their partial sum
+// independent of Sigma1(E) and Ch(E,F,G). The empty asm is a register-only
+// dependency: it prevents reassociation of the sum and emits no instruction.
+static inline __m512i sha256d_16way_t1( __m512i h, __m512i wk,
+                                        __m512i e, __m512i f, __m512i g )
+{
+   __m512i early = _mm512_add_epi32( h, wk );
+   __asm__( "" : "+v"( early ) );
+   return _mm512_add_epi32( early, _mm512_add_epi32( BSG2_1x16(e),
+                                                    CHx16(e,f,g) ) );
+}
+
+#define HEADER_ROUND_WITH( original, wk, A, B, C, D, E, F, G, H, i, j ) \
+   do { \
+      if ( group_t1 ) { \
+         __m512i t1 = sha256d_16way_t1( H, wk, E, F, G ); \
+         __m512i t2 = _mm512_add_epi32( BSG2_0x16(A), MAJx16(A,B,C) ); \
+         D = _mm512_add_epi32( D, t1 ); \
+         H = _mm512_add_epi32( t1, t2 ); \
+      } else { original( A, B, C, D, E, F, G, H, i, j ); } \
+   } while (0)
+#define HEADER_ROUND( A, B, C, D, E, F, G, H, i, j ) \
+   HEADER_ROUND_WITH( SHA256_16WAY_ROUND, \
+      _mm512_add_epi32( v512_32(K256[(i)+(j)]), W[i] ), A,B,C,D,E,F,G,H,i,j )
+#define HEADER_ROUND_NOMSG( A, B, C, D, E, F, G, H, i, j ) \
+   HEADER_ROUND_WITH( SHA256_16WAY_ROUND_NOMSG, \
+      v512_32(K256[(i)+(j)]), A,B,C,D,E,F,G,H,i,j )
+
+static inline __attribute__((always_inline)) void sha256_16x32_header_rounds( __m512i *state_out, const __m512i *data,
+          const __m512i *state_in, const __m512i *state_mid, const __m512i *X, int group_t1 )
 {
    __m512i A, B, C, D, E, F, G, H;
    __m512i W[16];
@@ -1178,18 +1209,18 @@ void sha256_16x32_final_rounds( __m512i *state_out, const __m512i *data,
    E = _mm512_add_epi32( E, W[3] );
 
    // rounds 4 to 15, ignore zero padding W[5..14]
-   SHA256_16WAY_ROUND      ( E, F, G, H, A, B, C, D,  4, 0 );   
-   SHA256_16WAY_ROUND_NOMSG( D, E, F, G, H, A, B, C,  5, 0 );
-   SHA256_16WAY_ROUND_NOMSG( C, D, E, F, G, H, A, B,  6, 0 );
-   SHA256_16WAY_ROUND_NOMSG( B, C, D, E, F, G, H, A,  7, 0 );
-   SHA256_16WAY_ROUND_NOMSG( A, B, C, D, E, F, G, H,  8, 0 );
-   SHA256_16WAY_ROUND_NOMSG( H, A, B, C, D, E, F, G,  9, 0 );
-   SHA256_16WAY_ROUND_NOMSG( G, H, A, B, C, D, E, F, 10, 0 );
-   SHA256_16WAY_ROUND_NOMSG( F, G, H, A, B, C, D, E, 11, 0 );
-   SHA256_16WAY_ROUND_NOMSG( E, F, G, H, A, B, C, D, 12, 0 );
-   SHA256_16WAY_ROUND_NOMSG( D, E, F, G, H, A, B, C, 13, 0 );
-   SHA256_16WAY_ROUND_NOMSG( C, D, E, F, G, H, A, B, 14, 0 );
-   SHA256_16WAY_ROUND      ( B, C, D, E, F, G, H, A, 15, 0 );
+   HEADER_ROUND      ( E, F, G, H, A, B, C, D,  4, 0 );
+   HEADER_ROUND_NOMSG( D, E, F, G, H, A, B, C,  5, 0 );
+   HEADER_ROUND_NOMSG( C, D, E, F, G, H, A, B,  6, 0 );
+   HEADER_ROUND_NOMSG( B, C, D, E, F, G, H, A,  7, 0 );
+   HEADER_ROUND_NOMSG( A, B, C, D, E, F, G, H,  8, 0 );
+   HEADER_ROUND_NOMSG( H, A, B, C, D, E, F, G,  9, 0 );
+   HEADER_ROUND_NOMSG( G, H, A, B, C, D, E, F, 10, 0 );
+   HEADER_ROUND_NOMSG( F, G, H, A, B, C, D, E, 11, 0 );
+   HEADER_ROUND_NOMSG( E, F, G, H, A, B, C, D, 12, 0 );
+   HEADER_ROUND_NOMSG( D, E, F, G, H, A, B, C, 13, 0 );
+   HEADER_ROUND_NOMSG( C, D, E, F, G, H, A, B, 14, 0 );
+   HEADER_ROUND      ( B, C, D, E, F, G, H, A, 15, 0 );
 
    // rounds 16 to 31 mexp part 2, add nonces.
    W[ 0] = X[ 0];
@@ -1211,7 +1242,7 @@ void sha256_16x32_final_rounds( __m512i *state_out, const __m512i *data,
    W[15] = _mm512_add_epi32( X[ 5], _mm512_add_epi32( SSG2_1x16( W[13] ),
                                                       W[ 8] ) );
 
-   SHA256_16WAY_16ROUNDS( A, B, C, D, E, F, G, H, 16 );
+   SHA256_16WAY_16ROUNDS_WITH( HEADER_ROUND, A, B, C, D, E, F, G, H, 16 );
 
    // rounds 32 to 63   
    W[ 0] = _mm512_add_epi32( X[ 6], _mm512_add_epi32( SSG2_1x16( W[14] ),
@@ -1232,9 +1263,9 @@ void sha256_16x32_final_rounds( __m512i *state_out, const __m512i *data,
    W[14] = SHA256_16WAY_MEXP( W[12], W[ 7], W[15], W[14] );
    W[15] = SHA256_16WAY_MEXP( W[13], W[ 8], W[ 0], W[15] );
 
-   SHA256_16WAY_16ROUNDS( A, B, C, D, E, F, G, H, 32 );
+   SHA256_16WAY_16ROUNDS_WITH( HEADER_ROUND, A, B, C, D, E, F, G, H, 32 );
    SHA256_MEXP_16WAY_16ROUNDS( W );
-   SHA256_16WAY_16ROUNDS( A, B, C, D, E, F, G, H, 48 );
+   SHA256_16WAY_16ROUNDS_WITH( HEADER_ROUND, A, B, C, D, E, F, G, H, 48 );
 
    A = _mm512_add_epi32( A, _mm512_load_si512( state_in     ) );
    B = _mm512_add_epi32( B, _mm512_load_si512( state_in + 1 ) );
@@ -1253,6 +1284,22 @@ void sha256_16x32_final_rounds( __m512i *state_out, const __m512i *data,
    _mm512_store_si512( state_out + 5,  F );
    _mm512_store_si512( state_out + 6,  G );
    _mm512_store_si512( state_out + 7,  H );
+}
+
+#undef HEADER_ROUND_NOMSG
+#undef HEADER_ROUND
+#undef HEADER_ROUND_WITH
+
+void sha256_16x32_final_rounds( __m512i *state_out, const __m512i *data,
+          const __m512i *state_in, const __m512i *state_mid, const __m512i *X )
+{
+   sha256_16x32_header_rounds( state_out, data, state_in, state_mid, X, 0 );
+}
+
+void sha256d_16x32_final_rounds( __m512i *state_out, const __m512i *data,
+          const __m512i *state_in, const __m512i *state_mid, const __m512i *X )
+{
+   sha256_16x32_header_rounds( state_out, data, state_in, state_mid, X, 1 );
 }
 
 // returns 0 if hash aborted early and invalid,
