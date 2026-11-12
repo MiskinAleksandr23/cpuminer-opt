@@ -1410,6 +1410,8 @@ int sha256_16x32_transform_le_short( __m512i *state_out, const __m512i *data,
    H56 = _mm512_add_epi32( H, _mm512_add_epi32( BSG2_0x16( A ),
                                                    MAJx16( A, B, C ) ) );
    
+   const __m512i saved_a56 = A;
+
    // Rounds 57 to 60 part 1
    G = _mm512_add_epi32( v512_32( K256[57] ),
                  mm512_add4_32( BSG2_1x16( D ), CHx16( D, E, F ), W[ 9], G ) );
@@ -1454,9 +1456,9 @@ int sha256_16x32_transform_le_short( __m512i *state_out, const __m512i *data,
 
    // Round 58 to 61 part 2
    F = _mm512_add_epi32( F, _mm512_add_epi32( BSG2_0x16( G57 ),
-                                                 MAJx16( G57, H, A ) ) );
+                                                 MAJx16( G57, H56, saved_a56 ) ) );
    E = _mm512_add_epi32( E, _mm512_add_epi32( BSG2_0x16( F ),
-                                                 MAJx16( F, G57, H ) ) );
+                                                 MAJx16( F, G57, H56 ) ) );
    D = _mm512_add_epi32( D, _mm512_add_epi32( BSG2_0x16( E ),
                                                  MAJx16( E, F, G57 ) ) );
    C = _mm512_add_epi32( C, _mm512_add_epi32( BSG2_0x16( D ),
